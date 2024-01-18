@@ -806,7 +806,9 @@ func (e *Engine) ReplicaAddStart(spdkClient *spdkclient.Client, replicaName, rep
 	e.ReplicaAddressMap[replicaName] = replicaAddress
 	e.ReplicaBdevNameMap[replicaName] = ""
 	e.ReplicaModeMap[replicaName] = types.ModeWO
+	updateRequired = true
 	e.log = e.log.WithField("replicaAddressMap", e.ReplicaAddressMap)
+	e.log.Infof("Engine started adding replica %s with address %s", replicaName, replicaAddress)
 
 	return nil
 }
