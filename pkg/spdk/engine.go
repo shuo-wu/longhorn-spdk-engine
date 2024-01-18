@@ -195,6 +195,15 @@ func (e *Engine) connectReplica(spdkClient *spdkclient.Client, replicaName, repl
 		return "", nil
 	}
 
+	defer func() {
+		if err != nil {
+			e.log.WithError(err).Errorf("Failed to connect replica %s with address %s, will do detach", replicaName, replicaAddress)
+			if _, detachErr := spdkClient.BdevNvmeDetachController(helperutil.GetNvmeControllerNameFromNamespaceName(bdevName)); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+				e.log.WithError(detachErr).Errorf("Failed to do detach as cleanup for replica %s with address %s after attach failure", replicaName, replicaAddress)
+			}
+		}
+	}()
+
 	nvmeBdevNameList, err := spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
 		helpertypes.DefaultCtrlrLossTimeoutSec, helpertypes.DefaultReconnectDelaySec, helpertypes.DefaultFastIOFailTimeoutSec)
 	if err != nil {
