@@ -2,6 +2,8 @@ module github.com/longhorn/longhorn-spdk-engine
 
 go 1.21
 
+replace github.com/longhorn/go-spdk-helper => github.com/shuo-wu/go-spdk-helper v0.0.0-20240130111657-de0eac3d0774
+
 require (
 	github.com/0xPolygon/polygon-edge v1.3.2
 	github.com/RoaringBitmap/roaring v1.2.3
