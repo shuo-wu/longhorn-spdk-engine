@@ -746,6 +746,329 @@ func (e *Engine) validateAndUpdateReplicaMode(replicaName string, bdev *spdktype
 	return types.ModeRW, nil
 }
 
+func (e *Engine) ReplicaAddStartOnline(spdkClient *spdkclient.Client, dstReplicaName, dstReplicaAddress string, localReplicaLvsNameMap map[string]string) (srcReplicaName string, err error) {
+	updateRequired := false
+
+	e.Lock()
+	defer func() {
+		e.Unlock()
+
+		if updateRequired {
+			e.UpdateCh <- nil
+		}
+	}()
+
+	// Syncing with the SPDK TGT server only when the engine is running.
+	if e.State != types.InstanceStateRunning {
+		return "", fmt.Errorf("invalid state %v for engine %s replica %s add start", e.State, e.Name, dstReplicaName)
+	}
+
+	if _, exists := e.ReplicaAddressMap[dstReplicaName]; exists {
+		return "", fmt.Errorf("replica %s already exists", dstReplicaName)
+	}
+
+	var engineErr error
+	defer func() {
+		if engineErr != nil {
+			if e.State != types.InstanceStateError {
+				e.State = types.InstanceStateError
+				updateRequired = true
+			}
+			e.ErrorMsg = err.Error()
+		} else {
+			if e.State != types.InstanceStateError {
+				e.ErrorMsg = ""
+			}
+		}
+		if engineErr != nil || err != nil {
+			e.ReplicaModeMap[dstReplicaName] = types.ModeERR
+			e.ReplicaBdevNameMap[dstReplicaName] = ""
+			updateRequired = true
+		}
+	}()
+
+	srcReplicaName, srcReplicaAddress := "", ""
+	for replicaName, replicaMode := range e.ReplicaModeMap {
+		if replicaMode != types.ModeRW {
+			continue
+		}
+		srcReplicaName = replicaName
+		srcReplicaAddress = e.ReplicaAddressMap[replicaName]
+		break
+	}
+	if srcReplicaName == "" || srcReplicaAddress == "" {
+		return "", fmt.Errorf("cannot find an RW replica in engine %s during replica %s add", e.Name, dstReplicaName)
+	}
+
+	replicaClients, err := e.getReplicaClients()
+	if err != nil {
+		return "", err
+	}
+	srcReplicaServiceCli := replicaClients[srcReplicaName]
+	dstReplicaServiceCli, err := GetServiceClient(dstReplicaAddress)
+	if err != nil {
+		return "", err
+	}
+
+	srcReplicaIP, _, _ := net.SplitHostPort(srcReplicaAddress)
+	dstReplicaIP, _, _ := net.SplitHostPort(dstReplicaAddress)
+
+	// Pause the IO and flush cache by suspending the NVMe initiator
+	if e.Frontend == types.FrontendSPDKTCPBlockdev {
+		// TODO: Do we still need to invoke `sync`?
+		if err = e.initiator.Suspend(false, false); err != nil {
+			engineErr = err
+			return "", errors.Wrapf(err, "failed to suspend NVMe initiator")
+		}
+		defer func() {
+			if err = e.initiator.Resume(); err != nil {
+				engineErr = err
+			}
+		}()
+	}
+
+	snapshotName := GenerateRebuildingSnapshotName()
+	updateRequired, err = e.snapshotOperationWithoutLock(spdkClient, replicaClients, snapshotName, SnapshotOperationCreate)
+	if err != nil {
+		engineErr = err
+		return "", err
+	}
+
+	// Ask the source replica to expose the newly created snapshot if the source replica and destination replica are not on the same node.
+	srcExternalSnapshotLvolAddress, err := srcReplicaServiceCli.ReplicaRebuildingSrcStart(srcReplicaName, snapshotName, srcReplicaIP == dstReplicaIP)
+	if err != nil {
+		return "", err
+	}
+
+	// The destination replica attaches the source replica exposed snapshot as the external snapshot then create a head based on it.
+	dstHeadLvolAddress, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcExternalSnapshotLvolAddress)
+	if err != nil {
+		return "", err
+	}
+
+	// The engine can add the destination replica head to the base bdev list of the RAID
+	bdevName, err := e.getBdevNameForReplica(spdkClient, localReplicaLvsNameMap, dstReplicaName, dstHeadLvolAddress, e.IP)
+	if err != nil {
+		return "", err
+	}
+	if _, err := spdkClient.BdevRaidGrowBaseBdev(e.Name, bdevName); err != nil {
+		engineErr = err
+		return "", err
+	}
+
+	e.ReplicaAddressMap[dstReplicaName] = dstReplicaAddress
+	e.ReplicaBdevNameMap[dstReplicaName] = bdevName
+	e.ReplicaModeMap[dstReplicaName] = types.ModeWO
+	e.log = e.log.WithField("replicaAddressMap", e.ReplicaAddressMap)
+
+	return srcReplicaName, nil
+}
+
+func (e *Engine) ReplicaShallowCopyOnline(srcReplicaName, dstReplicaName, dstReplicaAddress string) (err error) {
+	updateRequired := false
+	defer func() {
+		if updateRequired {
+			e.UpdateCh <- nil
+		}
+	}()
+
+	e.RLock()
+	// Syncing with the SPDK TGT server only when the engine is running.
+	if e.State != types.InstanceStateRunning {
+		e.RUnlock()
+		return fmt.Errorf("invalid state %v for engine %s replica %s shallow copy", e.State, e.Name, dstReplicaName)
+	}
+	srcReplicaAddress := e.ReplicaAddressMap[srcReplicaName]
+	e.RUnlock()
+
+	// TODO: Can we share the clients in the whole server?
+	srcReplicaServiceCli, err := GetServiceClient(srcReplicaAddress)
+	if err != nil {
+		return err
+	}
+	dstReplicaServiceCli, err := GetServiceClient(dstReplicaAddress)
+	if err != nil {
+		return err
+	}
+
+	rpcSrcReplica, err := srcReplicaServiceCli.ReplicaGet(srcReplicaName)
+	if err != nil {
+		return err
+	}
+
+	ancestorSnapshotName, latestSnapshotName := "", ""
+	for snapshotName, snapApiLvol := range rpcSrcReplica.Snapshots {
+		if snapApiLvol.Parent == "" {
+			ancestorSnapshotName = snapshotName
+		}
+		if snapApiLvol.Children[types.VolumeHead] {
+			latestSnapshotName = snapshotName
+		}
+	}
+	if ancestorSnapshotName == "" || latestSnapshotName == "" {
+		return fmt.Errorf("cannot find the ancestor snapshot %s or latest snapshot %s from RW replica %s snapshot map during engine %s replica %s shallow copy", ancestorSnapshotName, latestSnapshotName, srcReplicaName, e.Name, dstReplicaName)
+	}
+
+	var engineErr error
+	defer func() {
+		e.Lock()
+		if engineErr != nil {
+			if e.State != types.InstanceStateError {
+				e.State = types.InstanceStateError
+				updateRequired = true
+			}
+			e.ErrorMsg = err.Error()
+		} else {
+			if e.State != types.InstanceStateError {
+				e.ErrorMsg = ""
+			}
+		}
+		e.Unlock()
+
+		// Blindly mark the rebuilding replica as mode ERR now.
+		if err != nil {
+			// Blindly send rebuilding finish for src replica.
+			if srcReplicaErr := srcReplicaServiceCli.ReplicaRebuildingSrcFinish(srcReplicaName, dstReplicaName); srcReplicaErr != nil {
+				e.log.WithError(srcReplicaErr).Errorf("Failed to finish rebuilding for src replica %s with address %s after rebuilding failure, will do nothing", srcReplicaName, srcReplicaAddress)
+			}
+			e.Lock()
+			if e.ReplicaModeMap[dstReplicaName] != types.ModeERR {
+				e.ReplicaModeMap[dstReplicaName] = types.ModeERR
+				e.log.WithError(err).Errorf("Failed to rebuild replica %s with address %s from src replica %s with address %s, will mark the rebuilding replica mode as ERR", dstReplicaName, dstReplicaAddress, srcReplicaName, srcReplicaAddress)
+				updateRequired = true
+			}
+			e.Unlock()
+		}
+	}()
+
+	// Traverse the src replica snapshot tree with a DFS way and do shallow copy one by one
+	rebuildingSnapshotList := []string{}
+	rebuildingSnapshotList = getRebuildingSnapshotList(rpcSrcReplica, ancestorSnapshotName, rebuildingSnapshotList)
+	currentSnapshotName, prevSnapshotName := "", ""
+	for idx := 0; idx < len(rebuildingSnapshotList); idx++ {
+		currentSnapshotName = rebuildingSnapshotList[idx]
+		// TODO: Handle backing image
+		if prevSnapshotName == "" || rpcSrcReplica.Snapshots[currentSnapshotName].Parent != prevSnapshotName {
+			if err = srcReplicaServiceCli.ReplicaRebuildingSrcDetach(srcReplicaName, dstReplicaName); err != nil {
+				return err
+			}
+			// Create or Recreate a rebuilding lvol behinds the parent of the current snapshot
+			dstRebuildingLvolAddress, err := dstReplicaServiceCli.ReplicaRebuildingDstSnapshotRevert(dstReplicaName, rpcSrcReplica.Snapshots[currentSnapshotName].Parent)
+			if err != nil {
+				return err
+			}
+			if err = srcReplicaServiceCli.ReplicaRebuildingSrcAttach(srcReplicaName, dstReplicaName, dstRebuildingLvolAddress); err != nil {
+				return err
+			}
+		}
+		if err = srcReplicaServiceCli.ReplicaSnapshotShallowCopy(srcReplicaName, currentSnapshotName); err != nil {
+			return err
+		}
+		if err = dstReplicaServiceCli.ReplicaRebuildingDstSnapshotCreate(dstReplicaName, currentSnapshotName); err != nil {
+			return err
+		}
+		prevSnapshotName = currentSnapshotName
+	}
+
+	// Ask the source replica to detach the rebuilding lvol
+	if err = srcReplicaServiceCli.ReplicaRebuildingSrcDetach(srcReplicaName, dstReplicaName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (e *Engine) ReplicaAddFinishOnline(spdkClient *spdkclient.Client, srcReplicaName, dstReplicaName, dstReplicaAddress string) (err error) {
+	updateRequired := false
+
+	e.Lock()
+	defer func() {
+		e.Unlock()
+
+		if updateRequired {
+			e.UpdateCh <- nil
+		}
+	}()
+
+	// Syncing with the SPDK TGT server only when the engine is running.
+	if e.State != types.InstanceStateRunning {
+		return fmt.Errorf("invalid state %v for engine %s replica %s add finish", e.State, e.Name, srcReplicaName)
+	}
+	if _, exists := e.ReplicaAddressMap[srcReplicaName]; !exists {
+		return fmt.Errorf("replica %s does not exist in engine %s", srcReplicaName, e.Name)
+	}
+	if e.ReplicaModeMap[srcReplicaName] != types.ModeWO {
+		return fmt.Errorf("invalid mode %s for engine %s replica %s add finish", e.ReplicaModeMap[srcReplicaName], e.Name, srcReplicaName)
+	}
+
+	// TODO: Can we share the clients in the whole server?
+	srcReplicaAddress := e.ReplicaAddressMap[srcReplicaName]
+	srcReplicaServiceCli, err := GetServiceClient(srcReplicaAddress)
+	if err != nil {
+		return err
+	}
+	dstReplicaServiceCli, err := GetServiceClient(dstReplicaAddress)
+	if err != nil {
+		return err
+	}
+
+	var engineErr error
+	defer func() {
+		if engineErr != nil {
+			if e.State != types.InstanceStateError {
+				e.State = types.InstanceStateError
+				updateRequired = true
+			}
+			e.ErrorMsg = err.Error()
+		} else {
+			if e.State != types.InstanceStateError {
+				e.ErrorMsg = ""
+			}
+		}
+
+		// Blindly mark the rebuilding replica as mode ERR now.
+		if err != nil {
+			// Blindly send rebuilding finish for src replica.
+			if srcReplicaErr := srcReplicaServiceCli.ReplicaRebuildingSrcFinish(srcReplicaName, dstReplicaName); srcReplicaErr != nil {
+				e.log.WithError(srcReplicaErr).Errorf("Failed to finish rebuilding for src replica %s with address %s after rebuilding failure, will do nothing", srcReplicaName, srcReplicaAddress)
+			}
+			if e.ReplicaModeMap[dstReplicaName] != types.ModeERR {
+				e.ReplicaModeMap[dstReplicaName] = types.ModeERR
+				e.log.WithError(err).Errorf("Failed to rebuild replica %s with address %s from src replica %s with address %s, will mark the rebuilding replica mode as ERR", dstReplicaName, dstReplicaAddress, srcReplicaName, srcReplicaAddress)
+				updateRequired = true
+			}
+		}
+	}()
+
+	// Pause the IO again by suspending the NVMe initiator
+	if e.Frontend == types.FrontendSPDKTCPBlockdev {
+		// TODO: Do we still need to invoke `sync`?
+		if err = e.initiator.Suspend(false, false); err != nil {
+			engineErr = err
+			return errors.Wrapf(err, "failed to suspend NVMe initiator")
+		}
+		defer func() {
+			if err = e.initiator.Resume(); err != nil {
+				engineErr = err
+			}
+		}()
+	}
+
+	// The source replica will change the parent of the head to the newly rebuilt snapshot chain and detach the external snapshot.
+	// Besides, it should clean up the rebuilding lvol.
+	if err = srcReplicaServiceCli.ReplicaRebuildingSrcFinish(srcReplicaName, dstReplicaName); err != nil {
+		return err
+	}
+	// The source replica will unexpose the snapshot and wipe the rebuilding info.
+	if err = dstReplicaServiceCli.ReplicaRebuildingDstFinish(dstReplicaName); err != nil {
+		return err
+	}
+
+	e.ReplicaModeMap[dstReplicaName] = types.ModeRW
+
+	return nil
+}
+
 func (e *Engine) ReplicaAddStart(spdkClient *spdkclient.Client, replicaName, replicaAddress string) (err error) {
 	updateRequired := false
 
