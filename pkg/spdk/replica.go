@@ -747,10 +747,56 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 			return err
 		}
 		r.IsExposed = false
-		r.rebuildingPort = 0
 		updateRequired = true
 	}
+
+	bdevLvolMap, err := GetBdevLvolMap(spdkClient)
+	if err != nil {
+		return err
+	}
+
+	// Clean up the rebuilding related components and info
+	if err := r.doCleanupForRebuildingSrc(spdkClient); err != nil {
+		return err
+	}
+	if r.rebuildingPort != 0 {
+		rebuildingLvolName := GetReplicaRebuildingLvolName(r.Name)
+		if err := spdkClient.StopExposeBdev(helpertypes.GetNQN(rebuildingLvolName)); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			return err
+		}
+		if err := superiorPortAllocator.ReleaseRange(r.rebuildingPort, r.rebuildingPort); err != nil {
+			return errors.Wrapf(err, "failed to release port %d during replica deletion with cleanup flag %v", r.rebuildingPort, cleanupRequired)
+		}
+	}
+	r.rebuildingPort = 0
+	if r.rebuildingLvol != nil {
+		tmpRootLvol := bdevLvolMap[r.rebuildingLvol.Name]
+		for {
+			if tmpRootLvol.DriverSpecific.Lvol.BaseSnapshot == "" {
+				break
+			}
+			if !IsReplicaSnapshotLvol(r.Name, tmpRootLvol.DriverSpecific.Lvol.BaseSnapshot) {
+				break
+			}
+			if bdevLvolMap[tmpRootLvol.DriverSpecific.Lvol.BaseSnapshot] == nil {
+				break
+			}
+			tmpRootLvol = bdevLvolMap[tmpRootLvol.DriverSpecific.Lvol.BaseSnapshot]
+		}
+		if err := CleanupLvolTree(spdkClient, spdktypes.GetLvolNameFromAlias(tmpRootLvol.Aliases[0]), bdevLvolMap); err != nil {
+			return err
+		}
+	}
 	r.rebuildingLvol = nil
+	if r.srcSnapshotBdevName != "" {
+		controllerName := helperutil.GetNvmeControllerNameFromNamespaceName(r.srcSnapshotBdevName)
+		if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			return err
+		}
+	}
+	r.rebuildingSrcReplicaName = ""
+	r.rebuildingSrcSnapshotName = ""
+	r.rebuildingSrcSnapshotBdevName = ""
 	r.isRebuilding = false
 
 	// The port can be released once the rebuilding and expose are stopped.
@@ -774,19 +820,19 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 
 	updateRequired = true
 
-	// Retrieve the snapshot tree with BFS. Then do cleanup bottom up
-	var queue []*Lvol
+	// Clean up the valid snapshot tree
 	if len(r.ActiveChain) > 1 {
-		queue = []*Lvol{r.ActiveChain[1]}
-	}
-	for idx := 0; idx < len(queue); idx++ {
-		for _, child := range queue[idx].Children {
-			queue = append(queue, child)
+		if err := CleanupLvolTree(spdkClient, r.ActiveChain[1].Name, bdevLvolMap); err != nil {
+			return err
 		}
 	}
-	for idx := len(queue) - 1; idx >= 0; idx-- {
-		if _, err := spdkClient.BdevLvolDelete(queue[idx].UUID); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return err
+	// Clean up the potential leftover or orphan snapshot lvols
+	// For example, the parent/ancestor snapshot lvols of the removed rebuilding lvol
+	for snapshotLvolName, snapLvol := range r.SnapshotLvolMap {
+		if IsReplicaSnapshotLvol(r.Name, snapshotLvolName) {
+			if _, err := spdkClient.BdevLvolDelete(snapLvol.UUID); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+				return err
+			}
 		}
 	}
 
@@ -1172,6 +1218,11 @@ func (r *Replica) RebuildingSrcFinish(spdkClient *spdkclient.Client, dstReplicaN
 		return fmt.Errorf("found mismatching between the required dst replica name %s and the recorded dst replica name %s for replica %s rebuilding src finish", dstReplicaName, r.rebuildingDstReplicaName, r.Name)
 	}
 
+	updateRequired = true
+	return r.doCleanupForRebuildingSrc(spdkClient)
+}
+
+func (r *Replica) doCleanupForRebuildingSrc(spdkClient *spdkclient.Client) (err error) {
 	if r.rebuildingDstBdevName != "" && r.rebuildingDstBdevType == spdktypes.BdevTypeNvme {
 		controllerName := helperutil.GetNvmeControllerNameFromNamespaceName(r.rebuildingDstBdevName)
 		if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
@@ -1193,7 +1244,6 @@ func (r *Replica) RebuildingSrcFinish(spdkClient *spdkclient.Client, dstReplicaN
 	r.rebuildingDstReplicaName = ""
 	r.rebuildingDstBdevType = ""
 	r.exposedSnapshotAlias = ""
-	updateRequired = true
 
 	return nil
 }
