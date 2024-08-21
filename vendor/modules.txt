@@ -57,7 +57,7 @@ github.com/longhorn/go-common-libs/sync
 github.com/longhorn/go-common-libs/sys
 github.com/longhorn/go-common-libs/types
 github.com/longhorn/go-common-libs/utils
-# github.com/longhorn/go-spdk-helper v0.0.0-20240811121608-9383fa59dd7c
+# github.com/longhorn/go-spdk-helper v0.0.0-20240811121608-9383fa59dd7c => github.com/shuo-wu/go-spdk-helper v0.0.0-20240821042613-9963c4900db6
 ## explicit; go 1.22.0
 github.com/longhorn/go-spdk-helper/pkg/jsonrpc
 github.com/longhorn/go-spdk-helper/pkg/nvme
@@ -287,3 +287,4 @@ k8s.io/utils/internal/third_party/forked/golang/net
 k8s.io/utils/io
 k8s.io/utils/keymutex
 k8s.io/utils/net
+# github.com/longhorn/go-spdk-helper => github.com/shuo-wu/go-spdk-helper v0.0.0-20240821042613-9963c4900db6

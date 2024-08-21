@@ -665,6 +665,8 @@ func (c *Client) BdevRaidGrowBaseBdev(raidName, baseBdevName string) (growed boo
 //
 //	"adrfam": NVMe-oF target adrfam: ipv4, ipv6, ib, fc, intra_host
 //
+// "fabricsConnectTimeoutUs": The amount of time to spend before timing out during fabric connect on qpairs associated with this controller in microseconds.
+//
 // "ctrlrLossTimeoutSec": Controller loss timeout in seconds
 //
 // "reconnectDelaySec": Controller reconnect delay in seconds
@@ -673,7 +675,7 @@ func (c *Client) BdevRaidGrowBaseBdev(raidName, baseBdevName string) (growed boo
 //
 // "multipath": Multipathing behavior: disable, failover, multipath. Default is failover
 func (c *Client) BdevNvmeAttachController(name, subnqn, traddr, trsvcid string, trtype spdktypes.NvmeTransportType, adrfam spdktypes.NvmeAddressFamily,
-	ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec int32, multipath string) (bdevNameList []string, err error) {
+	fabricsConnectTimeoutUs, ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec int32, multipath string) (bdevNameList []string, err error) {
 	req := spdktypes.BdevNvmeAttachControllerRequest{
 		Name: name,
 		NvmeTransportID: spdktypes.NvmeTransportID{
@@ -683,10 +685,11 @@ func (c *Client) BdevNvmeAttachController(name, subnqn, traddr, trsvcid string, 
 			Trsvcid: trsvcid,
 			Adrfam:  adrfam,
 		},
-		CtrlrLossTimeoutSec:  ctrlrLossTimeoutSec,
-		ReconnectDelaySec:    reconnectDelaySec,
-		FastIOFailTimeoutSec: fastIOFailTimeoutSec,
-		Multipath:            multipath,
+		FabricsConnectTimeoutUs: fabricsConnectTimeoutUs,
+		CtrlrLossTimeoutSec:     ctrlrLossTimeoutSec,
+		ReconnectDelaySec:       reconnectDelaySec,
+		FastIOFailTimeoutSec:    fastIOFailTimeoutSec,
+		Multipath:               multipath,
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommand("bdev_nvme_attach_controller", req)

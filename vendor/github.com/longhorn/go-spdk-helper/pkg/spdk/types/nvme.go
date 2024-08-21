@@ -104,9 +104,10 @@ type BdevNvmeAttachControllerRequest struct {
 	Hostaddr  string `json:"hostaddr,omitempty"`
 	Hostsvcid string `json:"hostsvcid,omitempty"`
 
-	CtrlrLossTimeoutSec  int32 `json:"ctrlr_loss_timeout_sec"`
-	ReconnectDelaySec    int32 `json:"reconnect_delay_sec"`
-	FastIOFailTimeoutSec int32 `json:"fast_io_fail_timeout_sec"`
+	FabricsConnectTimeoutUs int32 `json:"fabrics_connect_timeout_us"`
+	CtrlrLossTimeoutSec     int32 `json:"ctrlr_loss_timeout_sec"`
+	ReconnectDelaySec       int32 `json:"reconnect_delay_sec"`
+	FastIOFailTimeoutSec    int32 `json:"fast_io_fail_timeout_sec"`
 
 	Multipath string `json:"multipath,omitempty"`
 }

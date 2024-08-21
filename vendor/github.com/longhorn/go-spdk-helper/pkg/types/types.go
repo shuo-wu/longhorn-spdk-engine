@@ -22,7 +22,8 @@ const (
 	ShallowCopyStateComplete   = "complete"
 	ShallowCopyStateError      = "error"
 
-	DefaultCtrlrLossTimeoutSec = 30
+	DefaultFabricsConnectTimeoutUs = 30 * 1000000
+	DefaultCtrlrLossTimeoutSec     = 30
 	// DefaultReconnectDelaySec can't be more than DefaultFastIoFailTimeoutSec, same for non-default values.
 	DefaultReconnectDelaySec    = 2
 	DefaultFastIOFailTimeoutSec = 15
