@@ -1794,8 +1794,10 @@ func (e *Engine) BackupRestoreFinish(spdkClient *spdkclient.Client) error {
 			return err
 		}
 		e.log.Infof("Attaching replica %s with address %s before finishing restoration", replicaName, replicaAddress)
-		_, err = spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
-			helpertypes.DefaultCtrlrLossTimeoutSec, helpertypes.DefaultReconnectDelaySec, helpertypes.DefaultFastIOFailTimeoutSec, helpertypes.DefaultMultipath)
+		_, err = spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName),
+			replicaIP, replicaPort, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+			helpertypes.DefaultFabricsConnectTimeoutUs, helpertypes.DefaultCtrlrLossTimeoutSec, helpertypes.DefaultReconnectDelaySec, helpertypes.DefaultFastIOFailTimeoutSec,
+			helpertypes.DefaultMultipath)
 		if err != nil {
 			return err
 		}
