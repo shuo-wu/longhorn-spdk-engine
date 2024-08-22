@@ -1501,8 +1501,18 @@ func (r *Replica) RebuildingDstFinish(spdkClient *spdkclient.Client) (err error)
 
 func (r *Replica) doCleanupForRebuildingDst(spdkClient *spdkclient.Client, cleanupRebuildingLvolTree bool) {
 	if r.rebuildingDstCache.srcReplicaAddress != "" {
+		uuid := ""
+		bdevs, err := spdkClient.BdevGetBdevs(r.rebuildingDstCache.externalSnapshotBdevName, 0)
+		if err != nil {
+			r.log.WithError(err).Errorf("Failed to get the external src snapshot bdev %s for rebuilding dst cleanup, will continue", r.rebuildingDstCache.externalSnapshotBdevName)
+		} else if len(bdevs) != 1 {
+			r.log.WithError(err).Errorf("Failed to get the only the external src snapshot bdev %s for rebuilding dst cleanup, will continue", r.rebuildingDstCache.externalSnapshotBdevName)
+		} else if len(bdevs) == 1 {
+			uuid = bdevs[0].UUID
+		}
+		r.log.Infof("Replica %s is disconnecting the external src snapshot bdev %s(%s)", r.Name, r.rebuildingDstCache.externalSnapshotBdevName, uuid)
 		if err := disconnectNVMfBdev(spdkClient, r.rebuildingDstCache.externalSnapshotBdevName); err != nil {
-			r.log.WithError(err).Errorf("Failed to disconnect the external src snapshot bdev %s for rebuilding dst cleanup, will continue", r.rebuildingDstCache.externalSnapshotBdevName)
+			r.log.WithError(err).Errorf("Failed to disconnect the external src snapshot bdev %s(%s) for rebuilding dst cleanup, will continue", r.rebuildingDstCache.externalSnapshotBdevName, uuid)
 		} else {
 			r.rebuildingDstCache.srcReplicaAddress = ""
 		}

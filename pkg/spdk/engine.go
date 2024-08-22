@@ -1167,7 +1167,7 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 	// Pause the IO again by suspending the NVMe initiator
 	// If something goes wrong, the engine will be marked as error, then we don't need to do anything for replicas. The deletion logic will take over the responsibility of cleanup.
 	if e.Frontend == types.FrontendSPDKTCPBlockdev && e.Endpoint != "" {
-		if err = e.initiator.Suspend(true, true); err != nil {
+		if err = e.initiator.Suspend(false, false); err != nil {
 			return errors.Wrapf(err, "failed to suspend NVMe initiator")
 		}
 		defer func() {
