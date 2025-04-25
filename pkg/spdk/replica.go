@@ -1479,6 +1479,7 @@ func (r *Replica) SnapshotHashStatus(snapshotName string) (state, checksum, errM
 	defer func() {
 		if err != nil && r.State != types.InstanceStateError {
 			r.State = types.InstanceStateError
+			r.log.WithError(err).Errorf("Replica %v failed to get hash status for snapshot %s", r.Name, snapshotName)
 			updateRequired = true
 		}
 	}()
