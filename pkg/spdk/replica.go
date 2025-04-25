@@ -258,7 +258,7 @@ func (r *Replica) stopSnapshotHash(spdkClient *spdkclient.Client, parentLvol *Lv
 		return nil
 	}
 	if hashStatus.State == types.ProgressStateInProgress {
-		if _, err := spdkClient.BdevLvolStopSnapshotChecksum(parentLvol.Alias); err != nil && jsonrpc.IsJSONRPCRespErrorNoSuchProcess(err) {
+		if _, err := spdkClient.BdevLvolStopSnapshotChecksum(parentLvol.Alias); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchProcess(err) {
 			return err
 		}
 		r.SnapshotLvolHashStatusMap.Delete(parentLvol.Name)
@@ -2238,7 +2238,7 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 			r.log.Infof("Replica found an intact snapshot lvol %s before the shallow copy", dstSnapSvcLvol.Alias)
 			rebuildingLvolCreated = true
 		}
-	} else { // Then check if there is an expired lvol available
+	} else {                                               // Then check if there is an expired lvol available
 		if bdevLvolMap[dstSnapshotParentLvolName] != nil { // For non-ancestor snapshot, check if dstSnapshotParentLvol has an expired lvol as child
 			for _, childLvolName := range bdevLvolMap[dstSnapshotParentLvolName].DriverSpecific.Lvol.Clones {
 				if IsReplicaExpiredLvol(r.Name, childLvolName) {
