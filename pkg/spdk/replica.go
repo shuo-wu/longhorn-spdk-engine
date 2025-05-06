@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	helperutil "github.com/longhorn/go-spdk-helper/pkg/util"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/api"
+	"github.com/longhorn/longhorn-spdk-engine/pkg/client"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/util"
 
@@ -40,6 +42,8 @@ const (
 	restorePeriodicRefreshInterval = 2 * time.Second
 
 	checksumWaitPeriodAfterRebuilding = 10 * time.Second
+
+	lvolRangeShallowCopyLength = uint64(1 << 10)
 )
 
 type Replica struct {
@@ -1768,6 +1772,103 @@ func (r *Replica) RebuildingSrcShallowCopyStart(spdkClient *spdkclient.Client, s
 	return
 }
 
+func (r *Replica) RebuildingSrcRangeShallowCopyStart(spdkClient *spdkclient.Client, snapshotName, dstRebuildingLvolAddress string, mismatchingClusterList []uint64) (err error) {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateInProgress || r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateStarting {
+		return fmt.Errorf("cannot start a range shallow copy from snapshot %s for the src replica %s since there is already a shallow copy starting or in progress", snapshotName, r.Name)
+	}
+
+	if err = r.rebuildingSrcDetachNoLock(spdkClient); err != nil {
+		return errors.Wrapf(err, "failed to detach the rebuilding lvol of the dst replica %s before src replica %s range shallow copy start", r.rebuildingSrcCache.dstReplicaName, r.Name)
+	}
+	if err = r.rebuildingSrcAttachNoLock(spdkClient, r.rebuildingSrcCache.dstReplicaName, dstRebuildingLvolAddress); err != nil {
+		return errors.Wrapf(err, "failed to attach the rebuilding lvol of the dst replica %s before src replica %s range shallow copy start", r.rebuildingSrcCache.dstReplicaName, r.Name)
+	}
+
+	var shallowCopyOpID uint32
+	defer func() {
+		if err != nil || shallowCopyOpID == 0 {
+			return
+		}
+		go func() {
+			timer := time.NewTimer(MaxShallowCopyWaitTime)
+			defer timer.Stop()
+			ticker := time.NewTicker(ShallowCopyCheckInterval)
+			defer ticker.Stop()
+			continuousRetryCount := 0
+			for stopWaiting := false; !stopWaiting; {
+				select {
+				case <-timer.C:
+					r.log.Errorf("Timeout waiting for the src replica %s range shallow copy %v complete before detaching the rebuilding lvol of the dst replica %s, will give up", r.Name, shallowCopyOpID, r.rebuildingSrcCache.dstReplicaName)
+					stopWaiting = true
+					break // nolint: staticcheck
+				case <-ticker.C:
+					r.Lock()
+					if r.rebuildingSrcCache.shallowCopySnapshotName != snapshotName {
+						r.Unlock()
+						stopWaiting = true
+						break
+					}
+					status, err := r.rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient)
+					r.Unlock()
+					if err != nil {
+						continuousRetryCount++
+						if continuousRetryCount > maxNumRetries {
+							r.log.WithError(err).Errorf("Failed to check the src replica %s range shallow copy %v status over %d times before detaching the rebuilding lvol of the dst replica %s, will give up", r.Name, shallowCopyOpID, maxNumRetries, r.rebuildingSrcCache.dstReplicaName)
+							stopWaiting = true
+							break
+						}
+						logrus.WithError(err).Errorf("Failed to check the src replica %s range shallow copy %v status before detaching the rebuilding lvol of the dst replica %s", r.Name, shallowCopyOpID, r.rebuildingSrcCache.dstReplicaName)
+						continue
+					}
+					continuousRetryCount = 0
+					if status.State == types.ProgressStateError || status.State == types.ProgressStateComplete {
+						stopWaiting = true
+						break // nolint: staticcheck
+					}
+				}
+			}
+		}()
+	}()
+
+	snapLvolName := GetReplicaSnapshotLvolName(r.Name, snapshotName)
+
+	if r.rebuildingSrcCache.dstRebuildingBdevName == "" {
+		return fmt.Errorf("no destination bdev for src replica %s range shallow copy start", r.Name)
+	}
+	if r.SnapshotLvolMap[snapLvolName] == nil {
+		return fmt.Errorf("cannot find snapshot %s for src replica %s range shallow copy start", snapshotName, r.Name)
+	}
+	snapSvcLvol := r.SnapshotLvolMap[snapLvolName]
+
+	if err := r.stopSnapshotHash(spdkClient, snapSvcLvol); err != nil {
+		return errors.Wrapf(err, "failed to stop snapshot %s(%s) checksum hashing before replica %s rebuilding src starts range shallow copy from it", snapLvolName, snapshotName, r.Name)
+	}
+
+	if shallowCopyOpID, err = spdkClient.BdevLvolStartRangeShallowCopy(snapSvcLvol.Alias, r.rebuildingSrcCache.dstRebuildingBdevName, mismatchingClusterList); err != nil {
+		return err
+	}
+
+	if r.rebuildingSrcCache.shallowCopySnapshotName != snapshotName {
+		r.rebuildingSrcCache.shallowCopySnapshotName = snapshotName
+		r.rebuildingSrcCache.shallowCopyStatus = ShallowCopyStatus{
+			TotalClusters: snapSvcLvol.ActualSize / defaultClusterSize,
+		}
+	} else {
+		r.rebuildingSrcCache.shallowCopyStatus.RangeHandledClusters = r.rebuildingSrcCache.shallowCopyStatus.HandledClusters
+	}
+	r.rebuildingSrcCache.shallowCopyOpID = shallowCopyOpID
+	r.rebuildingSrcCache.isRangeShallowCopy = true
+
+	if _, err = r.rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient); err != nil {
+		return err
+	}
+
+	return
+}
+
 func (r *Replica) rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient *spdkclient.Client) (status *spdktypes.ShallowCopyStatus, err error) {
 	if r.rebuildingSrcCache.shallowCopyOpID == 0 {
 		return &spdktypes.ShallowCopyStatus{}, nil
@@ -1929,7 +2030,7 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 		}
 		r.IsExposed = false
 	}
-	// TODO: Uncomment below code after the delta shallow copy API is ready
+	// TODO: Uncomment below code after the RAID delta bitmap feature is ready
 	//// For the old head, if it's a non-empty one, rename it for reuse later.
 	//// Otherwise, directly remove it
 	//if r.Head.ActualSize > 0 {
@@ -1985,7 +2086,7 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 			continue
 		}
 
-		// TODO: Uncomment below code after the delta shallow copy API is ready
+		// TODO: Uncomment below code after the RAID delta bitmap feature is ready
 		//// Rename the non-empty previous rebuilding lvol so that it can be reused later
 		//if lvolName == rebuildingLvolName {
 		//	if lvol.DriverSpecific.Lvol.NumAllocatedClusters > 0 {
@@ -2216,29 +2317,29 @@ func (r *Replica) doCleanupForRebuildingDst(spdkClient *spdkclient.Client) error
 }
 
 // rebuildingDstShallowCopyPrepare creates a new rebuilding lvol or renames an existing expired lvol as the rebuilding lvol for the dst replica.
-func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client, snapshotName string) (dstRebuildingLvolAddress string, err error) {
+func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client, srcReplicaServiceCli *client.SPDKClient, snapshotName string) (dstRebuildingLvolAddress string, requireRangeCopy bool, err error) {
 	rebuildingLvolName := GetReplicaRebuildingLvolName(r.Name)
 
 	dstSnapshotParentLvolName := ""
 	srcSnapSvcLvol := r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName]
 	if srcSnapSvcLvol == nil {
-		return "", fmt.Errorf("cannot find snapshot %s in the rebuilding snapshot list for replica %s shallow copy prepare", snapshotName, r.Name)
+		return "", false, fmt.Errorf("cannot find snapshot %s in the rebuilding snapshot list for replica %s shallow copy prepare", snapshotName, r.Name)
 	}
 	if srcSnapSvcLvol.Parent != "" {
 		if types.IsBackingImageSnapLvolName(srcSnapSvcLvol.Parent) {
 			if r.BackingImage == nil {
-				return "", fmt.Errorf("found a src snapshot lvol %s has parent backing image %s but the dst backing image lvol is nil for dst replica %v rebuilding snapshot %s shallow copy prepare", srcSnapSvcLvol.Name, srcSnapSvcLvol.Parent, r.Name, snapshotName)
+				return "", false, fmt.Errorf("found a src snapshot lvol %s has parent backing image %s but the dst backing image lvol is nil for dst replica %v rebuilding snapshot %s shallow copy prepare", srcSnapSvcLvol.Name, srcSnapSvcLvol.Parent, r.Name, snapshotName)
 			}
 			srcBIName, _, err := ExtractBackingImageAndDiskUUID(srcSnapSvcLvol.Parent)
 			if err != nil {
-				return "", errors.Wrapf(err, "failed to extract backing image name from the src snapshot lvol %s parent %s for dst replica %v rebuilding snapshot %s shallow copy prepare", srcSnapSvcLvol.Name, srcSnapSvcLvol.Parent, r.Name, snapshotName)
+				return "", false, errors.Wrapf(err, "failed to extract backing image name from the src snapshot lvol %s parent %s for dst replica %v rebuilding snapshot %s shallow copy prepare", srcSnapSvcLvol.Name, srcSnapSvcLvol.Parent, r.Name, snapshotName)
 			}
 			dstBIName, _, err := ExtractBackingImageAndDiskUUID(r.BackingImage.Name)
 			if err != nil {
-				return "", errors.Wrapf(err, "failed to extract backing image name from the dst backing image lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", r.BackingImage.Name, r.Name, snapshotName)
+				return "", false, errors.Wrapf(err, "failed to extract backing image name from the dst backing image lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", r.BackingImage.Name, r.Name, snapshotName)
 			}
 			if dstBIName != srcBIName {
-				return "", fmt.Errorf("found mismatching backing image name between the dst backing image lvol %s and the src snapshot %s parent %s for dst replica %v rebuilding snapshot shallow copy prepare", r.BackingImage.Name, snapshotName, srcSnapSvcLvol.Parent, r.Name)
+				return "", false, fmt.Errorf("found mismatching backing image name between the dst backing image lvol %s and the src snapshot %s parent %s for dst replica %v rebuilding snapshot shallow copy prepare", r.BackingImage.Name, snapshotName, srcSnapSvcLvol.Parent, r.Name)
 			}
 			dstSnapshotParentLvolName = r.BackingImage.Name
 		} else {
@@ -2249,12 +2350,12 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 	// Blindly clean up the existing rebuilding lvol
 	if r.rebuildingDstCache.rebuildingPort != 0 {
 		if err := spdkClient.StopExposeBdev(helpertypes.GetNQN(rebuildingLvolName)); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return "", err
+			return "", false, err
 		}
 	}
 	if r.rebuildingDstCache.rebuildingLvol != nil {
 		if _, err := spdkClient.BdevLvolDelete(r.rebuildingDstCache.rebuildingLvol.UUID); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return "", err
+			return "", false, err
 		}
 	}
 	r.rebuildingDstCache.rebuildingLvol = nil
@@ -2262,78 +2363,88 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 
 	bdevLvolMap, err := GetBdevLvolMapWithFilter(spdkClient, r.replicaLvolFilter)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	dstSnapshotLvolName := GetReplicaSnapshotLvolName(r.Name, snapshotName)
 	if bdevLvolMap[dstSnapshotLvolName] != nil { // If there is an existing snapshot lvol, clone a rebuilding lvol behinds it
 		// Otherwise, try to reuse the existing lvol
-		// TODO: For a corrupted or outdated snapshot lvol, we should create a rebuilding lvol before delete it. So that its clusters will be coalesced into the rebuilding lvol, then we can start a delta shallow copy
-		// TODO: In the future, we can move the below logic to r.RebuildingDstShallowCopyStart after the delta shallow copy API is ready
 		dstSnapSvcLvol := BdevLvolInfoToServiceLvol(bdevLvolMap[dstSnapshotLvolName])
+		if err := r.stopSnapshotHash(spdkClient, dstSnapSvcLvol); err != nil {
+			return "", false, errors.Wrapf(err, "failed to stop the existing snapshot %s checksum hashing before rebuilding dst replica reuses then clones a rebuilding lvol behind it", dstSnapshotLvolName)
+		}
 		isIntactSnap := srcSnapSvcLvol.SnapshotTimestamp == dstSnapSvcLvol.SnapshotTimestamp &&
 			srcSnapSvcLvol.ActualSize == dstSnapSvcLvol.ActualSize &&
-			srcSnapSvcLvol.SnapshotChecksum != "" && srcSnapSvcLvol.SnapshotChecksum == dstSnapSvcLvol.SnapshotChecksum
-		// For now directly delete the corrupted or outdated snapshot lvol and start a full shallow copy since we cannot validate existing data during the shallow copy
-		if !isIntactSnap {
+			srcSnapSvcLvol.SnapshotChecksum != "" && dstSnapSvcLvol.SnapshotChecksum != "" && srcSnapSvcLvol.SnapshotChecksum == dstSnapSvcLvol.SnapshotChecksum
+		if isIntactSnap {
+			if _, err = spdkClient.BdevLvolClone(dstSnapSvcLvol.Alias, rebuildingLvolName); err != nil {
+				return "", false, errors.Wrapf(err, "failed to clone rebuilding lvol %s behinds the existing intact snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", rebuildingLvolName, dstSnapSvcLvol.Alias, r.Name, snapshotName)
+			}
+			rebuildingLvolCreated = true
+			r.log.Infof("Replica found an intact snapshot lvol %s before the shallow copy", dstSnapSvcLvol.Alias)
+		} else {
+			// For an existing but corrupted or outdated snapshot lvol:
+			// 1. If it contains the range checksums, SPDK server will reuse it later.
+			// 2. If not, SPDK server should delete it then do full rebuilding to a brand new rebuilding lvol.
 			for childLvolName := range dstSnapSvcLvol.Children {
 				if _, err := spdkClient.BdevLvolDetachParent(spdktypes.GetLvolAlias(r.LvsName, childLvolName)); err != nil {
-					return "", errors.Wrapf(err, "failed to decouple the child lvol %s from the corrupted or outdated snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", childLvolName, dstSnapshotLvolName, r.Name, snapshotName)
+					return "", false, errors.Wrapf(err, "failed to decouple the child lvol %s from the corrupted or outdated snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", childLvolName, dstSnapshotLvolName, r.Name, snapshotName)
 				}
 			}
-			if _, err := spdkClient.BdevLvolDelete(dstSnapSvcLvol.Alias); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-				return "", errors.Wrapf(err, "failed to delete the corrupted or outdated snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapshotLvolName, r.Name, snapshotName)
-			}
-			r.log.Infof("Replica found a corrupted or outdated snapshot lvol %s and delete it before the shallow copy", GetReplicaRebuildingLvolName(r.Name))
-		} else {
-			if err := r.stopSnapshotHash(spdkClient, dstSnapSvcLvol); err != nil {
-				return "", errors.Wrapf(err, "failed to stop the existing snapshot %s checksum hashing before rebuilding dst replica reuses then clones a rebuilding lvol behind it", dstSnapshotLvolName)
-			}
-			if _, err = spdkClient.BdevLvolClone(dstSnapSvcLvol.Alias, rebuildingLvolName); err != nil {
-				return "", errors.Wrapf(err, "failed to clone rebuilding lvol %s behinds the existing snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", rebuildingLvolName, dstSnapSvcLvol.Alias, r.Name, snapshotName)
-			}
-			r.log.Infof("Replica found an intact snapshot lvol %s before the shallow copy", dstSnapSvcLvol.Alias)
-			rebuildingLvolCreated = true
-		}
-	} else {                                               // Then check if there is an expired lvol available
-		if bdevLvolMap[dstSnapshotParentLvolName] != nil { // For non-ancestor snapshot, check if dstSnapshotParentLvol has an expired lvol as child
-			for _, childLvolName := range bdevLvolMap[dstSnapshotParentLvolName].DriverSpecific.Lvol.Clones {
-				if IsReplicaExpiredLvol(r.Name, childLvolName) {
-					if _, err := spdkClient.BdevLvolRename(spdktypes.GetLvolAlias(r.LvsName, childLvolName), rebuildingLvolName); err != nil {
-						r.log.WithError(err).Warnf("Failed to rename the previous expired lvol %s to rebuilding lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare, will ignore it and continue", childLvolName, rebuildingLvolName, r.Name, snapshotName)
-					} else {
-						rebuildingLvolCreated = true
-						r.log.Infof("Replica found an expired lvol %s (with parent %s) and renamed it to rebuilding lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", childLvolName, dstSnapshotParentLvolName, rebuildingLvolName, r.Name, snapshotName)
-					}
-					break
+			if r.isEligibleForRebuildingDstForRangeShallowCopy(spdkClient, srcReplicaServiceCli, snapshotName) {
+				// For reusable corrupted or outdated snapshot lvol, we will clone the rebuilding lvol first. The snapshot deletion will be delayed until the range shallow copy is complete.
+				if _, err = spdkClient.BdevLvolClone(dstSnapSvcLvol.Alias, rebuildingLvolName); err != nil {
+					return "", false, errors.Wrapf(err, "failed to clone rebuilding lvol %s behinds the existing snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", rebuildingLvolName, dstSnapSvcLvol.Alias, r.Name, snapshotName)
 				}
-			}
-		} else { // For the ancestor snapshot, check if there is an orphan expired lvol
-			for lvolName, bdevLvol := range bdevLvolMap {
-				if IsReplicaExpiredLvol(r.Name, lvolName) && bdevLvol.DriverSpecific.Lvol.BaseSnapshot == "" {
-					if _, err := spdkClient.BdevLvolRename(spdktypes.GetLvolAlias(r.LvsName, lvolName), rebuildingLvolName); err != nil {
-						r.log.WithError(err).Warnf("Failed to rename the previous expired lvol %s to rebuilding lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare, will ignore it and continue", lvolName, rebuildingLvolName, r.Name, snapshotName)
-					} else {
-						rebuildingLvolCreated = true
-						r.log.Infof("Replica found an orphan expired lvol %s (with empty parent) and renamed it to rebuilding lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", lvolName, rebuildingLvolName, r.Name, snapshotName)
-					}
-					break
+				rebuildingLvolCreated = true
+				requireRangeCopy = true
+				r.log.Infof("Replica found the reusable corrupted or outdated snapshot lvol %s hence cloned the rebuilding lvol %s before the shallow copy", dstSnapSvcLvol.Alias, rebuildingLvolName)
+			} else {
+				if _, err = spdkClient.BdevLvolDelete(dstSnapSvcLvol.Alias); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+					return "", false, errors.Wrapf(err, "failed to delete the non-reusable corrupted or outdated snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapshotLvolName, r.Name, snapshotName)
 				}
+				r.log.Infof("Replica found the non-reusable corrupted or outdated snapshot lvol %s and deleted it before the shallow copy", dstSnapSvcLvol.Alias)
 			}
 		}
+		// TODO: Uncomment and modify the below code when SPDK server could verify and reuse the non-snapshot orphan lvol as rebuildng lvol to speed up the progress. (RAID delta bitmap feature)
+		//} else if bdevLvolMap[dstSnapshotParentLvolName] != nil {
+		//	// For ancestor snapshot, it's hard to quickly figure out if there is an orphan lvol that probably contains the data. Hence we will give up range shallow copy for this case.
+		//	// For non-ancestor snapshot, we can check if dstSnapshotParentLvol has only one expired lvol as child. If YES, this is probably the corrupted snapshot.
+		//	onlyExpiredChildLvolName := ""
+		//	for _, childLvolName := range bdevLvolMap[dstSnapshotParentLvolName].DriverSpecific.Lvol.Clones {
+		//		if IsReplicaExpiredLvol(r.Name, childLvolName) {
+		//			if onlyExpiredChildLvolName == "" {
+		//				onlyExpiredChildLvolName = childLvolName
+		//			} else {
+		//				onlyExpiredChildLvolName = ""
+		//				break
+		//			}
+		//		}
+		//	}
+		//	if onlyExpiredChildLvolName != "" {
+		//		if r.isEligibleForRebuildingDstForRangeShallowCopy(spdkClient, srcReplicaServiceCli, onlyExpiredChildLvolName, snapshotName) {
+		//			if _, err := spdkClient.BdevLvolRename(spdktypes.GetLvolAlias(r.LvsName, onlyExpiredChildLvolName), rebuildingLvolName); err != nil {
+		//				r.log.WithError(err).Warnf("Failed to rename the previous expired lvol %s to rebuilding lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare, will ignore it and continue", onlyExpiredChildLvolName, rebuildingLvolName, r.Name, snapshotName)
+		//			} else {
+		//				rebuildingLvolCreated = true
+		//				requireRangeCopy = true
+		//				r.log.Infof("Replica found an expired lvol %s (with parent %s) and renamed it to rebuilding lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", onlyExpiredChildLvolName, dstSnapshotParentLvolName, rebuildingLvolName, r.Name, snapshotName)
+		//			}
+		//		}
+		//	}
 	}
 
 	if !rebuildingLvolCreated {
 		if dstSnapshotParentLvolName != "" && bdevLvolMap[dstSnapshotParentLvolName] != nil {
 			dstSnapshotParentSvcLvol := BdevLvolInfoToServiceLvol(bdevLvolMap[dstSnapshotParentLvolName])
 			if err := r.stopSnapshotHash(spdkClient, dstSnapshotParentSvcLvol); err != nil {
-				return "", errors.Wrapf(err, "failed to stop snapshot %s checksum hashing before rebuilding dst replica prepares a rebuilding lvol behind it", dstSnapshotParentLvolName)
+				return "", false, errors.Wrapf(err, "failed to stop snapshot %s checksum hashing before rebuilding dst replica prepares a rebuilding lvol behind it", dstSnapshotParentLvolName)
 			}
 			if _, err = spdkClient.BdevLvolClone(dstSnapshotParentSvcLvol.Alias, rebuildingLvolName); err != nil {
-				return "", err
+				return "", false, err
 			}
 		} else {
 			if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, rebuildingLvolName, util.BytesToMiB(r.SpecSize), "", true); err != nil {
-				return "", err
+				return "", false, err
 			}
 		}
 	}
@@ -2341,13 +2452,13 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 	rebuildingLvolAlias := spdktypes.GetLvolAlias(r.LvsName, rebuildingLvolName)
 	rebuildingBdevLvol, err := spdkClient.BdevLvolGetByName(rebuildingLvolAlias, 0)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	r.rebuildingDstCache.rebuildingLvol = BdevLvolInfoToServiceLvol(&rebuildingBdevLvol)
 
 	if srcSnapSvcLvol.SpecSize != r.rebuildingDstCache.rebuildingLvol.SpecSize {
 		if _, err := spdkClient.BdevLvolResize(r.rebuildingDstCache.rebuildingLvol.Alias, util.BytesToMiB(srcSnapSvcLvol.SpecSize)); err != nil {
-			return "", err
+			return "", false, err
 		}
 		r.rebuildingDstCache.rebuildingLvol.SpecSize = srcSnapSvcLvol.SpecSize
 	}
@@ -2356,7 +2467,7 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 	if r.rebuildingDstCache.rebuildingPort != 0 {
 		nguid := commonutils.RandomID(nvmeNguidLength)
 		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID, nguid, r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort))); err != nil {
-			return "", err
+			return "", false, err
 		}
 		dstRebuildingLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)))
 	}
@@ -2364,7 +2475,63 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 
 	r.log.Infof("Rebuilding destination replica prepared its rebuilding lvol %s(%s) with parent %s for snapshot %s and expose it to %s", r.rebuildingDstCache.rebuildingLvol.Alias, r.rebuildingDstCache.rebuildingLvol.UUID, r.rebuildingDstCache.rebuildingLvol.Parent, snapshotName, dstRebuildingLvolAddress)
 
-	return dstRebuildingLvolAddress, nil
+	return dstRebuildingLvolAddress, requireRangeCopy, nil
+}
+
+func (r *Replica) isEligibleForRebuildingDstForRangeShallowCopy(spdkClient *spdkclient.Client, srcReplicaServiceCli *client.SPDKClient, snapshotName string) bool {
+	if _, err := spdkClient.BdevLvolGetRangeChecksums(spdktypes.GetLvolAlias(r.LvsName, snapshotName), 0, 1); err != nil {
+		return false
+	}
+	if _, err := srcReplicaServiceCli.ReplicaSnapshotRangeHashGet(r.rebuildingDstCache.srcReplicaName, snapshotName, 0, 1); err != nil {
+		return false
+	}
+	return true
+}
+
+func (r *Replica) rebuildingDstRangeShallowCopy(spdkClient *spdkclient.Client, srcReplicaServiceCli *client.SPDKClient, snapshotName, dstRebuildingLvolAddress string) (err error) {
+	totalClusterCount := uint64(r.SpecSize / defaultClusterSize)
+	offset, count := uint64(0), lvolRangeShallowCopyLength
+	dstSnapshotLvolName := GetReplicaSnapshotLvolName(r.Name, snapshotName)
+	dstSnapshotLvolAlias := spdktypes.GetLvolAlias(r.LvsName, dstSnapshotLvolName)
+
+	r.log.Debugf("Replica is starting range shallow copy for snapshot %s from src replica %s to dst replica %s with address %s", snapshotName, r.rebuildingDstCache.srcReplicaName, r.Name, dstRebuildingLvolAddress)
+
+	for offset < totalClusterCount {
+		if offset+count > totalClusterCount {
+			count = totalClusterCount - offset
+		}
+		dstReplicaRangeHashMap, err := spdkClient.BdevLvolGetRangeChecksums(dstSnapshotLvolName, offset, count)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get the range [%d, %d) cluster checksums from dst replica %s during range shallow copy of snapshot %s", offset, offset+count, r.Name, snapshotName)
+		}
+		srcReplicaRangeHashResp, err := srcReplicaServiceCli.ReplicaSnapshotRangeHashGet(r.rebuildingDstCache.srcReplicaName, snapshotName, offset, count)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get the range [%d, %d) snapshot checksums from src replica %s during range shallow copy of snapshot %s", offset, offset+count, r.Name, snapshotName)
+		}
+		srcReplicaRangeHashMap := srcReplicaRangeHashResp.RangeHashMap
+		mismatchingClusterList := make([]uint64, count)
+		for idx, clusterChecksum := range srcReplicaRangeHashMap {
+			if dstReplicaRangeHashMap[idx] != clusterChecksum {
+				mismatchingClusterList = append(mismatchingClusterList, offset+idx)
+			}
+		}
+		for idx := range dstReplicaRangeHashMap {
+			if _, exists := srcReplicaRangeHashMap[idx]; !exists {
+				mismatchingClusterList = append(mismatchingClusterList, offset+idx)
+			}
+		}
+		slices.Sort(mismatchingClusterList)
+		if err := srcReplicaServiceCli.ReplicaRebuildingSrcRangeShallowCopyStart(r.rebuildingDstCache.srcReplicaName, snapshotName, dstRebuildingLvolAddress, mismatchingClusterList); err != nil {
+			return errors.Wrapf(err, "failed to start the range shallow copy for snapshot %s in cluster range [%d, %d) from src replica %s to dst replica %s", snapshotName, offset, offset+count, r.rebuildingDstCache.srcReplicaName, r.Name)
+		}
+		offset += count
+	}
+
+	if _, err := spdkClient.BdevLvolDelete(dstSnapshotLvolAlias); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return errors.Wrapf(err, "failed to delete the corrupted or outdated snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapshotLvolAlias, r.Name, snapshotName)
+	}
+
+	return nil
 }
 
 // RebuildingDstShallowCopyStart let the dst replica ask the src replica to start a shallow copy from a snapshot to the rebuilding lvol.
@@ -2381,19 +2548,6 @@ func (r *Replica) RebuildingDstShallowCopyStart(spdkClient *spdkclient.Client, s
 		}
 	}()
 
-	dstRebuildingLvolAddress, err := r.rebuildingDstShallowCopyPrepare(spdkClient, snapshotName)
-	if err != nil {
-		return err
-	}
-
-	srcSnapSvcLvol := r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName]
-	if srcSnapSvcLvol == nil {
-		return fmt.Errorf("cannot find snapshot %s in the rebuilding snapshot list for replica %s shallow copy start", snapshotName, r.Name)
-	}
-	r.rebuildingDstCache.processingSnapshotName = snapshotName
-	r.rebuildingDstCache.processingSize = 0
-	r.rebuildingDstCache.processingState = types.ProgressStateInProgress
-
 	srcReplicaServiceCli, err := GetServiceClient(r.rebuildingDstCache.srcReplicaAddress)
 	if err != nil {
 		return err
@@ -2403,6 +2557,19 @@ func (r *Replica) RebuildingDstShallowCopyStart(spdkClient *spdkclient.Client, s
 			r.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during start rebuilding dst shallow copy", r.rebuildingDstCache.srcReplicaName, r.rebuildingDstCache.srcReplicaAddress)
 		}
 	}()
+
+	dstRebuildingLvolAddress, requireRangeCopy, err := r.rebuildingDstShallowCopyPrepare(spdkClient, srcReplicaServiceCli, snapshotName)
+	if err != nil {
+		return err
+	}
+
+	srcSnapSvcLvol := r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName]
+	if srcSnapSvcLvol == nil {
+		return fmt.Errorf("cannot find snapshot %s in the rebuilding snapshot list for rebuilding dst replica %s shallow copy start", snapshotName, r.Name)
+	}
+	r.rebuildingDstCache.processingSnapshotName = snapshotName
+	r.rebuildingDstCache.processingSize = 0
+	r.rebuildingDstCache.processingState = types.ProgressStateInProgress
 
 	dstSnapLvolName := GetReplicaSnapshotLvolName(r.Name, snapshotName)
 	dstSnapBdevLvol, err := spdkClient.BdevLvolGetByName(spdktypes.GetLvolAlias(r.LvsName, dstSnapLvolName), 0)
@@ -2415,8 +2582,14 @@ func (r *Replica) RebuildingDstShallowCopyStart(spdkClient *spdkclient.Client, s
 	}
 
 	// Otherwise, try to reuse the existing lvol
-	r.log.Infof("Replica directly reused an intact snapshot lvol %s then skipped the shallow copy", dstSnapLvolName)
 
+	if requireRangeCopy {
+		// Need to manually update the progress after reuse the intact existing snapshot lvol
+		r.log.Infof("Replica is starting range shallow copy for snapshot lvol %s", dstSnapLvolName)
+		return r.rebuildingDstRangeShallowCopy(spdkClient, srcReplicaServiceCli, snapshotName, dstRebuildingLvolAddress)
+	}
+
+	r.log.Infof("Replica directly reused an intact snapshot lvol %s then skipped the shallow copy", dstSnapLvolName)
 	// Need to manually update the progress after reuse the existing snapshot lvol
 	r.rebuildingDstCache.processingState = types.ProgressStateComplete
 	r.rebuildingDstCache.processingSize = dstSnapBdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * defaultClusterSize

@@ -338,7 +338,7 @@ func (c *SPDKClient) ReplicaRebuildingSrcRangeShallowCopyStart(srcReplicaName, s
 	if dstRebuildingLvolAddress == "" {
 		return fmt.Errorf("failed to start rebuilding src replica range shallow copy: missing required parameter dst rebuilding lvol address")
 	}
-	if mismatchingClusterList == nil || len(mismatchingClusterList) == 0 {
+	if len(mismatchingClusterList) == 0 {
 		return fmt.Errorf("failed to start rebuilding src replica range shallow copy: missing required parameter mismatching cluster list")
 	}
 
