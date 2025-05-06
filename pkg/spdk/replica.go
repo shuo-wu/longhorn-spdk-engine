@@ -1768,6 +1768,103 @@ func (r *Replica) RebuildingSrcShallowCopyStart(spdkClient *spdkclient.Client, s
 	return
 }
 
+func (r *Replica) RebuildingSrcRangeShallowCopyStart(spdkClient *spdkclient.Client, snapshotName, dstRebuildingLvolAddress string, mismatchingClusterList []uint64) (err error) {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateInProgress || r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateStarting {
+		return fmt.Errorf("cannot start a range shallow copy from snapshot %s for the src replica %s since there is already a shallow copy starting or in progress", snapshotName, r.Name)
+	}
+
+	if err = r.rebuildingSrcDetachNoLock(spdkClient); err != nil {
+		return errors.Wrapf(err, "failed to detach the rebuilding lvol of the dst replica %s before src replica %s range shallow copy start", r.rebuildingSrcCache.dstReplicaName, r.Name)
+	}
+	if err = r.rebuildingSrcAttachNoLock(spdkClient, r.rebuildingSrcCache.dstReplicaName, dstRebuildingLvolAddress); err != nil {
+		return errors.Wrapf(err, "failed to attach the rebuilding lvol of the dst replica %s before src replica %s range shallow copy start", r.rebuildingSrcCache.dstReplicaName, r.Name)
+	}
+
+	var shallowCopyOpID uint32
+	defer func() {
+		if err != nil || shallowCopyOpID == 0 {
+			return
+		}
+		go func() {
+			timer := time.NewTimer(MaxShallowCopyWaitTime)
+			defer timer.Stop()
+			ticker := time.NewTicker(ShallowCopyCheckInterval)
+			defer ticker.Stop()
+			continuousRetryCount := 0
+			for stopWaiting := false; !stopWaiting; {
+				select {
+				case <-timer.C:
+					r.log.Errorf("Timeout waiting for the src replica %s range shallow copy %v complete before detaching the rebuilding lvol of the dst replica %s, will give up", r.Name, shallowCopyOpID, r.rebuildingSrcCache.dstReplicaName)
+					stopWaiting = true
+					break // nolint: staticcheck
+				case <-ticker.C:
+					r.Lock()
+					if r.rebuildingSrcCache.shallowCopySnapshotName != snapshotName {
+						r.Unlock()
+						stopWaiting = true
+						break
+					}
+					status, err := r.rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient)
+					r.Unlock()
+					if err != nil {
+						continuousRetryCount++
+						if continuousRetryCount > maxNumRetries {
+							r.log.WithError(err).Errorf("Failed to check the src replica %s range shallow copy %v status over %d times before detaching the rebuilding lvol of the dst replica %s, will give up", r.Name, shallowCopyOpID, maxNumRetries, r.rebuildingSrcCache.dstReplicaName)
+							stopWaiting = true
+							break
+						}
+						logrus.WithError(err).Errorf("Failed to check the src replica %s range shallow copy %v status before detaching the rebuilding lvol of the dst replica %s", r.Name, shallowCopyOpID, r.rebuildingSrcCache.dstReplicaName)
+						continue
+					}
+					continuousRetryCount = 0
+					if status.State == types.ProgressStateError || status.State == types.ProgressStateComplete {
+						stopWaiting = true
+						break // nolint: staticcheck
+					}
+				}
+			}
+		}()
+	}()
+
+	snapLvolName := GetReplicaSnapshotLvolName(r.Name, snapshotName)
+
+	if r.rebuildingSrcCache.dstRebuildingBdevName == "" {
+		return fmt.Errorf("no destination bdev for src replica %s range shallow copy start", r.Name)
+	}
+	if r.SnapshotLvolMap[snapLvolName] == nil {
+		return fmt.Errorf("cannot find snapshot %s for src replica %s range shallow copy start", snapshotName, r.Name)
+	}
+	snapSvcLvol := r.SnapshotLvolMap[snapLvolName]
+
+	if err := r.stopSnapshotHash(spdkClient, snapSvcLvol); err != nil {
+		return errors.Wrapf(err, "failed to stop snapshot %s(%s) checksum hashing before replica %s rebuilding src starts range shallow copy from it", snapLvolName, snapshotName, r.Name)
+	}
+
+	if shallowCopyOpID, err = spdkClient.BdevLvolStartRangeShallowCopy(snapSvcLvol.Alias, r.rebuildingSrcCache.dstRebuildingBdevName, mismatchingClusterList); err != nil {
+		return err
+	}
+
+	if r.rebuildingSrcCache.shallowCopySnapshotName != snapshotName {
+		r.rebuildingSrcCache.shallowCopySnapshotName = snapshotName
+		r.rebuildingSrcCache.shallowCopyStatus = ShallowCopyStatus{
+			TotalClusters: snapSvcLvol.ActualSize / defaultClusterSize,
+		}
+	} else {
+		r.rebuildingSrcCache.shallowCopyStatus.RangeHandledClusters = r.rebuildingSrcCache.shallowCopyStatus.HandledClusters
+	}
+	r.rebuildingSrcCache.shallowCopyOpID = shallowCopyOpID
+	r.rebuildingSrcCache.isRangeShallowCopy = true
+
+	if _, err = r.rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient); err != nil {
+		return err
+	}
+
+	return
+}
+
 func (r *Replica) rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient *spdkclient.Client) (status *spdktypes.ShallowCopyStatus, err error) {
 	if r.rebuildingSrcCache.shallowCopyOpID == 0 {
 		return &spdktypes.ShallowCopyStatus{}, nil
