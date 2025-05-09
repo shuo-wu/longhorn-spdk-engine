@@ -141,7 +141,17 @@ type RebuildingSrcCache struct {
 
 	shallowCopySnapshotName string
 	shallowCopyOpID         uint32
-	shallowCopyStatus       spdktypes.ShallowCopyStatus
+	shallowCopyStatus       ShallowCopyStatus
+	isRangeShallowCopy      bool
+}
+
+type ShallowCopyStatus struct {
+	OperationID          uint32 `json:"operation_id"`
+	State                string `json:"state"`
+	Error                string `json:"error,omitempty"`
+	HandledClusters      uint64 `json:"handled_clusters"`
+	RangeHandledClusters uint64 `json:"range_handled_clusters"`
+	TotalClusters        uint64 `json:"total_clusters"`
 }
 
 func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
@@ -1609,7 +1619,7 @@ func (r *Replica) RebuildingSrcFinish(spdkClient *spdkclient.Client, dstReplicaN
 func (r *Replica) doCleanupForRebuildingSrc(spdkClient *spdkclient.Client) {
 	r.rebuildingSrcCache.shallowCopySnapshotName = ""
 	r.rebuildingSrcCache.shallowCopyOpID = 0
-	r.rebuildingSrcCache.shallowCopyStatus = spdktypes.ShallowCopyStatus{}
+	r.rebuildingSrcCache.shallowCopyStatus = ShallowCopyStatus{}
 
 	if r.rebuildingSrcCache.dstRebuildingBdevName != "" {
 		if err := disconnectNVMfBdev(spdkClient, r.rebuildingSrcCache.dstRebuildingBdevName); err != nil {
@@ -1749,7 +1759,7 @@ func (r *Replica) RebuildingSrcShallowCopyStart(spdkClient *spdkclient.Client, s
 	}
 	r.rebuildingSrcCache.shallowCopySnapshotName = snapshotName
 	r.rebuildingSrcCache.shallowCopyOpID = shallowCopyOpID
-	r.rebuildingSrcCache.shallowCopyStatus = spdktypes.ShallowCopyStatus{}
+	r.rebuildingSrcCache.shallowCopyStatus = ShallowCopyStatus{}
 
 	if _, err = r.rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClient); err != nil {
 		return err
@@ -1767,7 +1777,7 @@ func (r *Replica) rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClie
 	if r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateError || r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateComplete {
 		return &spdktypes.ShallowCopyStatus{
 			State:          r.rebuildingSrcCache.shallowCopyStatus.State,
-			CopiedClusters: r.rebuildingSrcCache.shallowCopyStatus.CopiedClusters,
+			CopiedClusters: r.rebuildingSrcCache.shallowCopyStatus.HandledClusters,
 			TotalClusters:  r.rebuildingSrcCache.shallowCopyStatus.TotalClusters,
 			Error:          r.rebuildingSrcCache.shallowCopyStatus.Error,
 		}, nil
@@ -1781,11 +1791,37 @@ func (r *Replica) rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClie
 		status.State = types.ProgressStateInProgress
 	}
 
-	r.rebuildingSrcCache.shallowCopyStatus = *status
+	r.rebuildingSrcCache.shallowCopyStatus.Error = status.Error
+	if !r.rebuildingSrcCache.isRangeShallowCopy {
+		r.rebuildingSrcCache.shallowCopyStatus.State = status.State
+		r.rebuildingSrcCache.shallowCopyStatus.HandledClusters = status.CopiedClusters
+		r.rebuildingSrcCache.shallowCopyStatus.TotalClusters = status.TotalClusters
+	} else {
+		// For range shallow copy, the status returned from SPDK API involves the specific range of clusters only. We need to do calculation for the total progress.
+		r.rebuildingSrcCache.shallowCopyStatus.HandledClusters = r.rebuildingSrcCache.shallowCopyStatus.RangeHandledClusters + status.CopiedClusters + status.UnmappedClusters
+		switch status.State {
+		case types.ProgressStateError:
+			r.rebuildingSrcCache.shallowCopyStatus.State = types.ProgressStateError
+		case types.ProgressStateComplete:
+			if r.rebuildingSrcCache.shallowCopyStatus.HandledClusters == r.rebuildingSrcCache.shallowCopyStatus.TotalClusters {
+				r.rebuildingSrcCache.shallowCopyStatus.State = types.ProgressStateComplete
+			} else {
+				r.rebuildingSrcCache.shallowCopyStatus.State = types.ProgressStateInProgress
+			}
+		case types.ProgressStateStarting:
+			if r.rebuildingSrcCache.shallowCopyStatus.RangeHandledClusters == 0 {
+				r.rebuildingSrcCache.shallowCopyStatus.State = types.ProgressStateStarting
+			} else {
+				r.rebuildingSrcCache.shallowCopyStatus.State = types.ProgressStateInProgress
+			}
+		default:
+			return nil, fmt.Errorf("found unknown shallow copy state %s for src replica %s shallow copy %v", status.State, r.Name, r.rebuildingSrcCache.shallowCopyOpID)
+		}
+	}
 
 	// The status update and the detachment should be done atomically
 	// Otherwise, the next shallow copy will be started before this detachment complete. In other words, the next shallow copy will be failed by this detachment.
-	if status.State == types.ProgressStateError || status.State == types.ProgressStateComplete {
+	if r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateError || r.rebuildingSrcCache.shallowCopyStatus.State == types.ProgressStateComplete {
 		err = r.rebuildingSrcDetachNoLock(spdkClient)
 		if err != nil {
 			r.log.WithError(err).Errorf("Failed to detach the rebuilding lvol of the dst replica %s after src replica %s shallow copy %v from snapshot %s finish, will continue", r.rebuildingSrcCache.dstReplicaName, r.Name, r.rebuildingSrcCache.shallowCopyOpID, r.rebuildingSrcCache.shallowCopySnapshotName)
@@ -1799,7 +1835,12 @@ func (r *Replica) rebuildingSrcShallowCopyStatusUpdateAndHandlingNoLock(spdkClie
 func (r *Replica) RebuildingSrcShallowCopyCheck(snapshotName string) (status spdktypes.ShallowCopyStatus, err error) {
 	r.RLock()
 	recordedSnapshotName := r.rebuildingSrcCache.shallowCopySnapshotName
-	status = r.rebuildingSrcCache.shallowCopyStatus
+	status = spdktypes.ShallowCopyStatus{
+		State:          r.rebuildingSrcCache.shallowCopyStatus.State,
+		Error:          r.rebuildingSrcCache.shallowCopyStatus.Error,
+		CopiedClusters: r.rebuildingSrcCache.shallowCopyStatus.HandledClusters,
+		TotalClusters:  r.rebuildingSrcCache.shallowCopyStatus.TotalClusters,
+	}
 	r.RUnlock()
 
 	if snapshotName != recordedSnapshotName {
@@ -2253,7 +2294,7 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 			r.log.Infof("Replica found an intact snapshot lvol %s before the shallow copy", dstSnapSvcLvol.Alias)
 			rebuildingLvolCreated = true
 		}
-	} else { // Then check if there is an expired lvol available
+	} else {                                               // Then check if there is an expired lvol available
 		if bdevLvolMap[dstSnapshotParentLvolName] != nil { // For non-ancestor snapshot, check if dstSnapshotParentLvol has an expired lvol as child
 			for _, childLvolName := range bdevLvolMap[dstSnapshotParentLvolName].DriverSpecific.Lvol.Clones {
 				if IsReplicaExpiredLvol(r.Name, childLvolName) {
