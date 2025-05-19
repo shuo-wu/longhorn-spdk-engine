@@ -2447,21 +2447,44 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 			// 1. If it contains the range checksums, SPDK server will reuse it later.
 			// 2. If not, SPDK server should delete it then do full rebuilding to a brand new rebuilding lvol.
 			for childLvolName := range dstSnapSvcLvol.Children {
+				_, err1 := spdkClient.BdevLvolGetRangeChecksums(spdktypes.GetLvolAlias(r.LvsName, childLvolName), 0, 1)
 				if _, err := spdkClient.BdevLvolDetachParent(spdktypes.GetLvolAlias(r.LvsName, childLvolName)); err != nil {
 					return "", false, errors.Wrapf(err, "failed to decouple the child lvol %s from the corrupted or outdated snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", childLvolName, dstSnapshotLvolName, r.Name, snapshotName)
+				}
+				if err1 == nil {
+					if _, err2 := spdkClient.BdevLvolGetRangeChecksums(spdktypes.GetLvolAlias(r.LvsName, childLvolName), 0, 1); err2 != nil {
+						r.log.Infof(">>>> Replica found child lvol %s lost its range checksums after detaching from the reusable snapshot lvol %s", childLvolName, dstSnapSvcLvol.Name)
+					}
 				}
 			}
 			if r.isEligibleForRebuildingDstForRangeShallowCopy(spdkClient, srcReplicaServiceCli, snapshotName) {
 				// For reusable corrupted or outdated snapshot lvol, we will clone the rebuilding lvol first. The snapshot deletion will be delayed until the range shallow copy is complete.
 				// The reason for detaching the parent of reusable corrupted or outdated snapshot lvol is, spdk_tgt requires the rebuilding lvol being backed by a zeros bdev so that it can release clusters after unmapping the rebuilding lvol.
+
+				dstSnapBdevLvol, err := spdkClient.BdevLvolGetByName(dstSnapSvcLvol.Alias, 0)
+				if err != nil {
+					return "", false, errors.Wrapf(err, "failed to get the snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapSvcLvol.Alias, r.Name, snapshotName)
+				}
+				dstSnapSvcLvol = BdevLvolInfoToServiceLvol(&dstSnapBdevLvol)
+				r.log.Infof(">>>> Replica snapshot lvol %s has Parent %s and Children %+v before rebuilding lvol clone for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapSvcLvol.Alias, dstSnapSvcLvol.Parent, dstSnapSvcLvol.Children, r.Name, snapshotName)
+
 				if dstSnapSvcLvol.Parent != "" {
+					r.log.Infof(">>>> Replica is detaching the reusable corrupted or outdated snapshot lvol %s from parent %s for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapSvcLvol.Alias, dstSnapSvcLvol.Parent, r.Name, snapshotName)
 					if _, err := spdkClient.BdevLvolDetachParent(dstSnapSvcLvol.Alias); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-						return "", false, errors.Wrapf(err, "failed to detach the corrupted or outdated snapshot lvol %s from its parent for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapshotLvolName, r.Name, snapshotName)
+						return "", false, errors.Wrapf(err, "failed to detach the corrupted or outdated snapshot lvol %s from its parent for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapSvcLvol.Alias, r.Name, snapshotName)
 					}
 				}
 				if _, err = spdkClient.BdevLvolClone(dstSnapSvcLvol.Alias, rebuildingLvolName); err != nil {
 					return "", false, errors.Wrapf(err, "failed to clone rebuilding lvol %s behinds the existing snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", rebuildingLvolName, dstSnapSvcLvol.Alias, r.Name, snapshotName)
 				}
+
+				dstSnapBdevLvol, err = spdkClient.BdevLvolGetByName(dstSnapSvcLvol.Alias, 0)
+				if err != nil {
+					return "", false, errors.Wrapf(err, "failed to get the snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapSvcLvol.Alias, r.Name, snapshotName)
+				}
+				dstSnapSvcLvol = BdevLvolInfoToServiceLvol(&dstSnapBdevLvol)
+				r.log.Infof(">>>> Replica snapshot lvol %s has Parent %s and Children %+v after rebuilding lvol clone for dst replica %v rebuilding snapshot %s shallow copy prepare", dstSnapSvcLvol.Alias, dstSnapSvcLvol.Parent, dstSnapSvcLvol.Children, r.Name, snapshotName)
+
 				rebuildingLvolCreated = true
 				requireRangeCopy = true
 				r.log.Infof("Replica found the reusable corrupted or outdated snapshot lvol %s hence cloned the rebuilding lvol %s before the shallow copy", dstSnapSvcLvol.Alias, rebuildingLvolName)
@@ -2522,6 +2545,7 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 		return "", false, err
 	}
 	r.rebuildingDstCache.rebuildingLvol = BdevLvolInfoToServiceLvol(&rebuildingBdevLvol)
+	r.log.Infof(">>>> Replica prepared a new rebuilding lvol %s(%s) behind snapshot lvol %s for dst replica %v rebuilding snapshot %s shallow copy prepare", r.rebuildingDstCache.rebuildingLvol.Alias, r.rebuildingDstCache.rebuildingLvol.UUID, r.rebuildingDstCache.rebuildingLvol.Parent, r.Name, snapshotName)
 
 	if srcSnapSvcLvol.SpecSize != r.rebuildingDstCache.rebuildingLvol.SpecSize {
 		if _, err := spdkClient.BdevLvolResize(r.rebuildingDstCache.rebuildingLvol.Alias, util.BytesToMiB(srcSnapSvcLvol.SpecSize)); err != nil {
