@@ -2,6 +2,8 @@ module github.com/longhorn/longhorn-spdk-engine
 
 go 1.26.0
 
+replace github.com/longhorn/types => github.com/shuo-wu/types v0.0.0-20260809045332-36ecea94a60f
+
 require (
 	github.com/0xPolygon/polygon-edge v1.3.3
 	github.com/avast/retry-go/v5 v5.0.0
